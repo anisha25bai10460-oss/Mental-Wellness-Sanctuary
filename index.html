@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mental Wellness Sanctuary</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Chart.js for visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <!-- Load Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <style>
+        /* Custom Font */
+        @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap');
+        body {
+            font-family: 'Nunito', sans-serif;
+            background-color: #f0fdfa; /* Light Teal/Blue Background */
+        }
+        .theme-card {
+            background-color: #ffffff;
+            border: 1px solid #e0f2f7; /* Very light blue border */
+            box-shadow: 0 4px 12px rgba(126, 179, 219, 0.1); /* Soft shadow */
+        }
+        .theme-button {
+            transition: all 0.2s;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- GLOBAL SETUP ---
+        // MANDATORY: Use Canvas environment variables
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        // CORRECTED: Ensure spelling matches the global variable name
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null; 
+        
+        let app, db, auth, userId = null;
+        let unsubscribeEntries = null;
+        let entries = [];
+        let moodChartInstance = null;
+        let entryToDeleteId = null; // State for the delete modal
+
+        // --- UTILITIES ---
+
+        function showMessage(message, isError = false) {
+            const container = document.getElementById('message-container');
+            container.textContent = message;
+            container.className = `p-3 mb-4 rounded-xl text-sm font-medium ${isError ? 'bg-red-100 text-red-700' : 'bg-teal-100 text-teal-700'} fixed top-4 left-1/2 transform -translate-x-1/2 w-11/12 md:w-1/3 z-50 shadow-lg`;
+            container.style.display = 'block';
+            setTimeout(() => {
+                container.style.display = 'none';
+            }, 5000);
+        }
+
+        // --- FIREBASE INITIALIZATION & AUTHENTICATION ---
+
+        async function initFirebase() {
+            if (!firebaseConfig) {
+                showMessage("Firebase config is missing. Cannot initialize application.", true);
+                return;
+            }
+
+            // setLogLevel('debug'); // Uncomment to debug Firestore logs
+
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Now using the correctly spelled variable
+                if (initialAuthToken) { 
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Wait for auth state to stabilize
+                await new Promise(resolve => {
+                    onAuthStateChanged(auth, (user) => {
+                        if (user) {
+                            userId = user.uid;
+                            document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                            setupRealtimeListener();
+                            resolve();
+                        } else {
+                            showMessage("Authentication failed. Using anonymous ID.", true);
+                            userId = crypto.randomUUID(); // Fallback ID
+                            document.getElementById('user-id-display').textContent = `Anon ID: ${userId}`;
+                            resolve();
+                        }
+                    });
+                });
+                showMessage("Sanctuary initialized and connected to Firestore!");
+
+            } catch (e) {
+                console.error("Firebase Initialization Error:", e);
+                showMessage(`Initialization failed: ${e.message}`, true);
+            }
+        }
+
+        // --- DATABASE HELPERS ---
+        
+        function getEntriesCollectionRef() {
+             // CRITICAL FIX: Add guard clause here for asynchronous initialization safety
+             if (!db || !userId) {
+                throw new Error("Database not initialized or User ID missing.");
+             }
+             // Private data path for the user: /artifacts/{appId}/users/{userId}/entries
+             return collection(db, 'artifacts', appId, 'users', userId, 'entries');
+        }
+
+        function getEntryDocRef(entryId) {
+             if (!db || !userId) {
+                throw new Error("Database not initialized or User ID missing.");
+             }
+             return doc(db, 'artifacts', appId, 'users', userId, 'entries', entryId);
+        }
+        
+        function setupRealtimeListener() {
+            if (!db || !userId) return;
+
+            if (unsubscribeEntries) {
+                unsubscribeEntries(); // Detach previous listener if needed
+            }
+
+            // We fetch all data and sort client-side to avoid index issues with Firestore
+            try {
+                const q = query(getEntriesCollectionRef());
+
+                unsubscribeEntries = onSnapshot(q, (snapshot) => {
+                    entries = [];
+                    snapshot.forEach((doc) => {
+                        entries.push({ id: doc.id, ...doc.data() });
+                    });
+
+                    // Sort client-side by date descending
+                    entries.sort((a, b) => b.date.localeCompare(a.date));
+
+                    renderEntriesTable();
+                    updateAnalytics();
+
+                }, (error) => {
+                    console.error("Firestore Listener Error:", error);
+                    showMessage("Failed to load entries: Check console for details.", true);
+                });
+            } catch (error) {
+                 // This catches the error if the listener setup fails due to initialization race condition
+                 console.error("Failed to setup listener:", error);
+            }
+        }
+
+        // --- CRUD OPERATIONS (Data Input & Processing) ---
+
+        window.handleLogEntry = async () => {
+             // CRITICAL FIX: Safety guard (addresses the error from the screenshot)
+            if (!db || !userId) {
+                showMessage("App is still initializing. Please wait for the 'Sanctuary initialized' message.", true);
+                return;
+            }
+
+            const date = document.getElementById('log-date').value;
+            const mood = parseInt(document.getElementById('log-mood').value);
+            const sleep = parseFloat(document.getElementById('log-sleep').value);
+            const stress = parseInt(document.getElementById('log-stress').value);
+            const anxiety = parseInt(document.getElementById('log-anxiety').value);
+
+            if (!date || isNaN(mood) || isNaN(sleep) || isNaN(stress) || isNaN(anxiety)) {
+                showMessage("Please fill all fields with valid numbers.", true);
+                return;
+            }
+
+            if (mood < 1 || mood > 5 || stress < 1 || stress > 10 || anxiety < 1 || anxiety > 10 || sleep < 0) {
+                showMessage("Mood must be 1-5. Stress/Anxiety must be 1-10. Sleep must be positive.", true);
+                return;
+            }
+
+            try {
+                // Check if an entry for this date already exists (Simple check to prevent duplicates)
+                const existingEntry = entries.find(e => e.date === date);
+
+                if (existingEntry) {
+                    showMessage(`Entry for ${date} already exists. Use the Edit function.`, true);
+                    return;
+                }
+                
+                // Add doc using the guarded collection reference
+                await addDoc(getEntriesCollectionRef(), {
+                    date, mood, sleep, stress, anxiety,
+                    timestamp: new Date().toISOString()
+                });
+
+                showMessage("✅ Mood entry logged successfully!");
+
+            } catch (e) {
+                // Catches the error thrown by getEntriesCollectionRef() or addDoc
+                console.error("CREATE Error:", e);
+                showMessage(`Failed to log entry: ${e.message}`, true);
+            }
+        };
+        
+        window.handleEditEntry = (entryId) => {
+            if (!db || !userId) {
+                return showMessage("App is not ready.", true);
+            }
+
+            const entry = entries.find(e => e.id === entryId);
+            if (!entry) return showMessage("Entry not found.", true);
+
+            // Simple prompt for edit (keeping consistent with non-modal approach for quick editing)
+            const newMood = prompt(`Editing Entry ${entryId} (${entry.date}). Enter new Mood (1-5, current: ${entry.mood}):`, entry.mood);
+            if (newMood === null) return;
+            const newSleep = prompt(`Enter new Sleep (Hours, current: ${entry.sleep}):`, entry.sleep);
+            if (newSleep === null) return;
+            
+            const moodVal = parseInt(newMood);
+            const sleepVal = parseFloat(newSleep);
+
+            if (isNaN(moodVal) || isNaN(sleepVal) || moodVal < 1 || moodVal > 5 || sleepVal < 0) {
+                 return showMessage("Invalid mood or sleep value entered.", true);
+            }
+
+            updateDoc(getEntryDocRef(entryId), {
+                mood: moodVal,
+                sleep: sleepVal
+            })
+            .then(() => showMessage(`✅ Entry ${entryId} updated successfully!`))
+            .catch(e => {
+                console.error("UPDATE Error:", e);
+                showMessage("Failed to update entry.", true);
+            });
+        };
+        
+        // Custom Modal Logic for Delete (replacing confirm())
+        window.handleDeleteEntry = (entryId) => {
+             if (!db || !userId) {
+                return showMessage("App is not ready.", true);
+            }
+            entryToDeleteId = entryId;
+            document.getElementById('modal-entry-id').textContent = entryId;
+            document.getElementById('delete-modal').classList.remove('hidden');
+        };
+
+        window.confirmDelete = () => {
+            if (entryToDeleteId) {
+                deleteDoc(getEntryDocRef(entryToDeleteId))
+                    .then(() => showMessage(`🗑️ Entry ${entryToDeleteId} deleted.`))
+                    .catch(e => {
+                        console.error("DELETE Error:", e);
+                        showMessage("Failed to delete entry.", true);
+                    })
+                    .finally(() => {
+                        entryToDeleteId = null;
+                        document.getElementById('delete-modal').classList.add('hidden');
+                    });
+            }
+        };
+
+        window.cancelDelete = () => {
+            entryToDeleteId = null;
+            document.getElementById('delete-modal').classList.add('hidden');
+        };
+
+        // --- RENDERING ---
+
+        function renderEntriesTable() {
+            const container = document.getElementById('entries-table-body');
+            if (!container) return;
+
+            container.innerHTML = '';
+            
+            if (entries.length === 0) {
+                container.innerHTML = '<tr><td colspan="6" class="p-4 text-center text-gray-500">No entries recorded yet.</td></tr>';
+                return;
+            }
+
+            entries.forEach(entry => {
+                const row = `
+                    <tr class="border-b border-gray-100 hover:bg-sky-50 transition duration-100">
+                        <td class="p-3 text-sm font-medium text-gray-700">${entry.date}</td>
+                        <td class="p-3 text-center text-sm">${entry.mood}</td>
+                        <td class="p-3 text-center text-sm">${entry.sleep.toFixed(1)}h</td>
+                        <td class="p-3 text-center text-sm">${entry.stress}</td>
+                        <td class="p-3 text-center text-sm">${entry.anxiety}</td>
+                        <td class="p-3 text-right text-sm space-x-2">
+                            <button onclick="handleEditEntry('${entry.id}')" class="text-purple-600 hover:text-purple-800 font-medium transition duration-100">Edit</button>
+                            <button onclick="handleDeleteEntry('${entry.id}')" class="text-red-500 hover:text-red-700 font-medium transition duration-100">Delete</button>
+                        </td>
+                    </tr>
+                `;
+                container.innerHTML += row;
+            });
+        }
+        
+        // --- ANALYTICS & VISUALIZATION (Reporting) ---
+
+        function calculateAverage(data, key) {
+             if (data.length === 0) return 0;
+             const sum = data.reduce((acc, entry) => acc + entry[key], 0);
+             return (sum / data.length).toFixed(2);
+        }
+
+        function updateAnalytics() {
+            const recentEntries = entries.slice(0, 7); // Last 7 days/entries
+            
+            const weeklyMoodAvg = calculateAverage(recentEntries, 'mood');
+            const weeklySleepAvg = calculateAverage(recentEntries, 'sleep');
+
+            document.getElementById('weekly-mood-avg').textContent = `${weeklyMoodAvg} / 5`;
+            document.getElementById('weekly-sleep-avg').textContent = `${weeklySleepAvg} h`;
+
+            generateCharts();
+        }
+
+        function generateCharts() {
+            if (entries.length < 2) return;
+            
+            const chartData = entries.slice(0, 10).reverse(); // Last 10 days, chronological
+            const dates = chartData.map(e => e.date);
+            const moods = chartData.map(e => e.mood);
+            const sleeps = chartData.map(e => e.sleep);
+            
+            const ctx = document.getElementById('moodSleepChart').getContext('2d');
+            
+            if (moodChartInstance) {
+                moodChartInstance.destroy();
+            }
+
+            moodChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: dates,
+                    datasets: [
+                        {
+                            label: 'Mood Score (1-5)',
+                            data: moods,
+                            borderColor: '#0ea5e9', // Sky Blue
+                            backgroundColor: 'rgba(14, 165, 233, 0.15)',
+                            yAxisID: 'yMood',
+                            tension: 0.4
+                        },
+                        {
+                            label: 'Sleep Hours',
+                            data: sleeps,
+                            borderColor: '#10b981', // Teal Green
+                            backgroundColor: 'rgba(16, 185, 129, 0.15)',
+                            yAxisID: 'ySleep',
+                            tension: 0.4
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false,
+                    },
+                    scales: {
+                        yMood: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: { display: true, text: 'Mood (1-5)' },
+                            min: 1,
+                            max: 5,
+                            grid: { drawOnChartArea: false },
+                        },
+                        ySleep: {
+                            type: 'linear',
+                            display: true,
+                            position: 'right',
+                            title: { display: true, text: 'Sleep (Hours)' },
+                            min: 0,
+                            max: 12,
+                        },
+                        x: {
+                            title: { display: true, text: 'Date' }
+                        }
+                    },
+                    plugins: {
+                        legend: { position: 'top' }
+                    }
+                }
+            });
+            
+            
+        }
+        
+        // --- PREDICTION MOCK (ML Prediction) ---
+        // Simple Mock Logic: Predict next mood based on a weighted average of
+        // last 3 moods and a reverse correlation to the last stress level.
+
+        window.runPrediction = () => {
+             if (entries.length < 5) {
+                return showMessage("Need at least 5 entries for a prediction mock.", true);
+             }
+
+             const lastMoods = entries.slice(0, 3).map(e => e.mood);
+             const avgMood = lastMoods.reduce((a, b) => a + b, 0) / lastMoods.length;
+             const lastStress = entries[0].stress;
+             
+             // Prediction heuristic: Average Mood + (10 - Stress Level) * 0.05
+             let predictionValue = avgMood + (10 - lastStress) * 0.05;
+             predictionValue = Math.max(1.0, Math.min(5.0, predictionValue));
+
+             const predictionBox = document.getElementById('prediction-result');
+             predictionBox.innerHTML = `
+                <div class="bg-sky-50 p-4 rounded-xl border border-sky-200 shadow-inner">
+                    <h4 class="font-semibold text-sky-700 flex items-center justify-center space-x-2">
+                        <i class="fa-solid fa-brain"></i>
+                        <span>Predicted Mood for Tomorrow</span>
+                    </h4>
+                    <p class="text-4xl font-extrabold text-sky-600 mt-2">${predictionValue.toFixed(2)} / 5</p>
+                    <p class="text-xs text-gray-500 mt-1">Based on recent metrics (Heuristic Mock).</p>
+                </div>
+             `;
+             showMessage("Prediction generated successfully!");
+        };
+
+        // --- App Start ---
+        document.addEventListener('DOMContentLoaded', initFirebase);
+    </script>
+</head>
+<body class="font-sans">
+
+    <!-- Message Container -->
+    <div id="message-container" class="hidden"></div>
+
+    <!-- Delete Confirmation Modal (Custom UI Component) -->
+    <div id="delete-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50 transition-opacity duration-300">
+        <div class="relative top-20 mx-auto p-5 border w-96 shadow-2xl rounded-xl theme-card">
+            <div class="mt-3 text-center">
+                <div class="mx-auto flex items-center justify-center h-12 w-12 rounded-full bg-red-100">
+                    <i class="fa-solid fa-trash-can text-red-600 text-xl"></i>
+                </div>
+                <h3 class="text-lg leading-6 font-medium text-gray-900 mt-2">Confirm Deletion</h3>
+                <div class="mt-2 px-7 py-3">
+                    <p class="text-sm text-gray-500">Are you sure you want to delete entry <span id="modal-entry-id" class="font-bold text-red-500"></span>? This action cannot be undone.</p>
+                </div>
+                <div class="items-center px-4 py-3 sm:flex sm:flex-row-reverse">
+                    <button id="modal-confirm-btn" onclick="confirmDelete()" type="button" class="w-full inline-flex justify-center rounded-lg border border-transparent px-4 py-2 bg-red-600 text-base font-medium text-white hover:bg-red-700 sm:ml-3 sm:w-auto sm:text-sm theme-button">
+                        Delete Permanently
+                    </button>
+                    <button id="modal-cancel-btn" onclick="cancelDelete()" type="button" class="mt-3 w-full inline-flex justify-center rounded-lg px-4 py-2 bg-white text-base font-medium text-gray-700 border border-gray-300 hover:bg-gray-50 sm:mt-0 sm:w-auto sm:text-sm theme-button">
+                        Cancel
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="container mx-auto p-4 md:p-8">
+        <header class="text-center mb-10">
+            <h1 class="text-5xl font-extrabold text-sky-700">Mental Wellness Sanctuary</h1>
+            <p class="text-gray-500 mt-2 text-sm" id="user-id-display">Initializing...</p>
+        </header>
+
+        <!-- Main Grid Layout -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            
+            <!-- Column 1: Logging (CRUD Create) -->
+            <div class="lg:col-span-1 theme-card p-6 rounded-xl h-fit">
+                <h2 class="text-2xl font-bold mb-6 text-sky-800 border-b border-sky-100 pb-2 flex items-center space-x-2">
+                    <i class="fa-solid fa-pen-to-square"></i>
+                    <span>1. Log Daily Entry</span>
+                </h2>
+                
+                <div class="space-y-4">
+                    <!-- Date Input -->
+                    <div>
+                        <label for="log-date" class="block text-sm font-semibold text-gray-700">Date</label>
+                        <input type="date" id="log-date" value="" class="mt-1 block w-full rounded-lg border border-gray-200 p-3 shadow-sm focus:border-sky-500 focus:ring-sky-500 transition duration-100" required>
+                        <script>document.getElementById('log-date').value = new Date().toISOString().split('T')[0];</script>
+                    </div>
+
+                    <!-- Mood Input -->
+                    <div>
+                        <label for="log-mood" class="block text-sm font-semibold text-gray-700">Mood (1=Bad to 5=Great)</label>
+                        <input type="number" id="log-mood" min="1" max="5" class="mt-1 block w-full rounded-lg border border-gray-200 p-3 shadow-sm focus:border-sky-500 focus:ring-sky-500" required>
+                    </div>
+
+                    <!-- Sleep Input -->
+                    <div>
+                        <label for="log-sleep" class="block text-sm font-semibold text-gray-700">Sleep (Hours)</label>
+                        <input type="number" step="0.1" id="log-sleep" min="0" class="mt-1 block w-full rounded-lg border border-gray-200 p-3 shadow-sm focus:border-sky-500 focus:ring-sky-500" required>
+                    </div>
+
+                    <!-- Stress Input -->
+                    <div>
+                        <label for="log-stress" class="block text-sm font-semibold text-gray-700">Stress Level (1=Low to 10=High)</label>
+                        <input type="number" id="log-stress" min="1" max="10" class="mt-1 block w-full rounded-lg border border-gray-200 p-3 shadow-sm focus:border-sky-500 focus:ring-sky-500" required>
+                    </div>
+
+                    <!-- Anxiety Input -->
+                    <div>
+                        <label for="log-anxiety" class="block text-sm font-semibold text-gray-700">Anxiety Level (1=Low to 10=High)</label>
+                        <input type="number" id="log-anxiety" min="1" max="10" class="mt-1 block w-full rounded-lg border border-gray-200 p-3 shadow-sm focus:border-sky-500 focus:ring-sky-500" required>
+                    </div>
+
+                    <button onclick="handleLogEntry()" 
+                            class="theme-button w-full mt-6 py-3 px-4 rounded-xl text-lg font-bold text-white bg-sky-500 hover:bg-sky-600 focus:outline-none focus:ring-4 focus:ring-offset-2 focus:ring-sky-300 transform hover:scale-[1.01]">
+                        <i class="fa-solid fa-cloud-arrow-up mr-2"></i> Save Entry
+                    </button>
+                </div>
+            </div>
+
+            <!-- Column 2: History & CRUD Management (Read, Update, Delete) -->
+            <div class="lg:col-span-2 theme-card p-6 rounded-xl">
+                <h2 class="text-2xl font-bold mb-6 text-sky-800 border-b border-sky-100 pb-2 flex items-center space-x-2">
+                    <i class="fa-solid fa-book-open"></i>
+                    <span>2. Entry History (CRUD Management)</span>
+                </h2>
+                
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200 rounded-xl overflow-hidden shadow-md">
+                        <thead class="bg-sky-50">
+                            <tr>
+                                <th class="p-4 text-left text-xs font-bold text-gray-700 uppercase tracking-wider">Date</th>
+                                <th class="p-4 text-center text-xs font-bold text-gray-700 uppercase tracking-wider">Mood</th>
+                                <th class="p-4 text-center text-xs font-bold text-gray-700 uppercase tracking-wider">Sleep (h)</th>
+                                <th class="p-4 text-center text-xs font-bold text-gray-700 uppercase tracking-wider">Stress</th>
+                                <th class="p-4 text-center text-xs font-bold text-gray-700 uppercase tracking-wider">Anxiety</th>
+                                <th class="p-4 text-right text-xs font-bold text-gray-700 uppercase tracking-wider">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="entries-table-body" class="bg-white divide-y divide-gray-100">
+                            <tr><td colspan="6" class="p-6 text-center text-gray-500">Loading entries...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Column 3 (Full Width): Analytics and Prediction -->
+            <div class="lg:col-span-3">
+                <h2 class="text-2xl font-bold mb-6 text-sky-800 border-b border-sky-100 pb-2 flex items-center space-x-2">
+                    <i class="fa-solid fa-chart-area"></i>
+                    <span>3. Insights & Prediction</span>
+                </h2>
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                    <!-- Weekly Mood Average (Reporting) -->
+                    <div class="theme-card p-5 rounded-xl text-center border-teal-200">
+                        <p class="text-sm font-semibold text-teal-600">Weekly Mood Average</p>
+                        <p id="weekly-mood-avg" class="text-4xl font-extrabold text-teal-800 mt-1">N/A</p>
+                        <p class="text-xs text-gray-500">Avg. 7 most recent entries</p>
+                    </div>
+                    
+                    <!-- Weekly Sleep Average (Reporting) -->
+                    <div class="theme-card p-5 rounded-xl text-center border-purple-200">
+                        <p class="text-sm font-semibold text-purple-600">Weekly Sleep Average</p>
+                        <p id="weekly-sleep-avg" class="text-4xl font-extrabold text-purple-800 mt-1">N/A</p>
+                        <p class="text-xs text-gray-500">Avg. 7 most recent entries</p>
+                    </div>
+
+                    <!-- Prediction Mock (ML Element) -->
+                    <div class="theme-card p-5 rounded-xl text-center border-sky-200">
+                        <button onclick="runPrediction()" 
+                                class="theme-button w-full py-3 px-4 rounded-xl text-lg font-bold text-white bg-blue-500 hover:bg-blue-600 focus:outline-none focus:ring-4 focus:ring-offset-2 focus:ring-blue-300 transform hover:scale-[1.01]">
+                            <i class="fa-solid fa-wand-magic-sparkles mr-2"></i> Run Mood Prediction
+                        </button>
+                        <div id="prediction-result" class="mt-4 text-center">
+                            <p class="text-sm text-gray-500">Click to predict next day's mood.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Visualization -->
+                <div class="theme-card p-6 rounded-xl">
+                    <h3 class="text-xl font-bold mb-4 text-sky-800">Mood and Sleep Trend (Last 10 Days)</h3>
+                    <div class="h-96 w-full">
+                        <canvas id="moodSleepChart"></canvas>
+                    </div>
+                </div>
+
+            </div>
+
+        </div>
+
+    </div>
+</body>
+</html>
